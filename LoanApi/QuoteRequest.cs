@@ -1,0 +1,1 @@
+public record QuoteRequest(string CustomerId, decimal Amount, int Months = 12);
