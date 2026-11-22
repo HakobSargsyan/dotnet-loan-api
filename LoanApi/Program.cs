@@ -120,4 +120,85 @@ app.MapPost("/explain", async (QuoteRequest req, IEnumerable<ILoanCalculator> ca
 });
 
 
+app.MapPost("/explain/stream", async (QuoteRequest req, IEnumerable<ILoanCalculator> calcs,
+IChatClient chat, HttpResponse response, ILogger<Program> logger, CancellationToken ct) =>
+{
+    var results = new List<object>();
+    var errors = new Dictionary<string, string[]>();
+
+    if (req.Amount <= 0) errors["amount"] = ["Amount must be greater than 0"];
+    if (req.Months <= 0) errors["month"] = ["Month must be greater than 0"];
+
+    if (errors.Count > 0) {
+        logger.LogWarning("Invalid quote request: {@Errors}", errors);
+        return Results.ValidationProblem(errors);
+    }
+
+    var loan = new LoanRequest(req.CustomerId, req.Amount, req.Months);
+
+    var annuity = calcs.OfType<AnnuityCalculator>().First();
+    decimal payment = Math.Round(annuity.MonthlyPayment(loan), 2);
+    decimal totalInterest = ( payment * req.Months ) - req.Amount;
+
+    string prompt = $"""
+        You are a bank assistant, writing to a customer with no finance background.
+        Facts (already calculated by the bank, use them exactly, do not recalculate):
+        - Loan amount: {req.Amount} AMD
+        - Term: {req.Months} months
+        - Annual interest rate: {rate:P0}
+        - Monthly payment: {payment} AMD
+        - Total interest over the loan: {totalInterest} AMD
+        Task: explain this loan in short sentences.
+        Rules: plain language, no markdown, do not give financial advice, do not mention numbers that are not in the facts.
+        """;
+
+    response.ContentType = "text/plain; charset=utf-8";
+    await foreach (ChatResponseUpdate update in chat.GetStreamingResponseAsync(prompt, cancellationToken: ct))
+    {
+       await response.WriteAsync(update.Text);
+       await response.Body.FlushAsync(ct);
+    }
+
+    return Results.Empty;
+});
+
+
+app.MapPost("/explain/structured", async (QuoteRequest req, IEnumerable<ILoanCalculator> calcs,
+IChatClient chat, ILogger<Program> logger, CancellationToken ct) =>
+{
+    var results = new List<object>();
+    var errors = new Dictionary<string, string[]>();
+
+    if (req.Amount <= 0) errors["amount"] = ["Amount must be greater than 0"];
+    if (req.Months <= 0) errors["month"] = ["Month must be greater than 0"];
+
+    if (errors.Count > 0) {
+        logger.LogWarning("Invalid quote request: {@Errors}", errors);
+        return Results.ValidationProblem(errors);
+    }
+
+    var loan = new LoanRequest(req.CustomerId, req.Amount, req.Months);
+
+    var annuity = calcs.OfType<AnnuityCalculator>().First();
+    decimal payment = Math.Round(annuity.MonthlyPayment(loan), 2);
+    decimal totalInterest = ( payment * req.Months ) - req.Amount;
+
+    string prompt = $"""
+        You are a bank assistant, writing to a customer with no finance background.
+        Facts (already calculated by the bank, use them exactly, do not recalculate):
+        - Loan amount: {req.Amount} AMD
+        - Term: {req.Months} months
+        - Annual interest rate: {rate:P0}
+        - Monthly payment: {payment} AMD
+        - Total interest over the loan: {totalInterest} AMD
+        Task: explain this loan in short sentences.
+        Rules: plain language, no markdown, do not give financial advice, do not mention numbers that are not in the facts.
+        """;
+
+    ChatResponse<LoanExplanation> response = await chat.GetResponseAsync<LoanExplanation>(prompt, cancellationToken: ct);
+    return Results.Ok(new { payment, totalInterest, explanation = response.Result });
+});
+
+
+
 app.Run();

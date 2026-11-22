@@ -1,0 +1,1 @@
+public record LoanExplanation(string Summary, string[] KeyPoints, string RiskNote);
