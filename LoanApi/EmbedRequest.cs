@@ -1,0 +1,1 @@
+public record EmbedRequest(string Text);

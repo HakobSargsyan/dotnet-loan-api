@@ -3,6 +3,8 @@ using LoanApi;
 using Microsoft.EntityFrameworkCore;
 using Anthropic;
 using Microsoft.Extensions.AI;
+using OllamaSharp;
+using System.Numerics.Tensors;
 
 var builder = WebApplication.CreateBuilder(args);
 string anthropicKey = builder.Configuration["Anthropic:ApiKey"]
@@ -19,10 +21,21 @@ builder.Services.AddSingleton<ILoanCalculator, SimpleCalculator>();
 builder.Services.AddSingleton<ILoanCalculator>(_ => new AnnuityCalculator(rate));
 builder.Services.AddChatClient(
     new AnthropicClient { ApiKey = anthropicKey }.AsIChatClient("claude-haiku-5-5"));
+builder.Services.AddEmbeddingGenerator(
+    new OllamaApiClient(new Uri("http://localhost:11434"), "nomic-embed-text"));
+builder.Services.AddSingleton<ProductStore>();
 
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
     scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.EnsureCreated();
+
+
+//init store
+var store = app.Services.GetRequiredService<ProductStore>();
+var gen = app.Services.GetRequiredService<IEmbeddingGenerator<string, Embedding<float>>>();
+await store.IngestAsync(gen, CancellationToken.None);
+// store
+
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -199,6 +212,99 @@ IChatClient chat, ILogger<Program> logger, CancellationToken ct) =>
     return Results.Ok(new { payment, totalInterest, explanation = response.Result });
 });
 
+
+app.MapPost("/embed", async (EmbedRequest req, IEmbeddingGenerator<string, Embedding<float>> gen, ILogger<Program> logger, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            { nameof(req.Text), ["Text should be greater than 0"] }
+        });
+    }
+
+    var embedding = await gen.GenerateAsync([req.Text], cancellationToken: ct);
+
+    var vectorSize = embedding[0].Vector.Length;
+    var first5 = embedding[0].Vector.Slice(0,5);
+    return Results.Ok(new
+    {
+        dimensions = vectorSize,
+        first5 = first5
+    });
+
+});
+
+app.MapGet("/products/chunks", (ProductStore store) =>
+{
+   var products = store.Products.Select(chunk => new
+    {
+         source = chunk.Source,
+         text = chunk.Text,
+         dimensions = chunk.Vector.Length
+    });
+
+
+    return Results.Ok(products);
+
+});
+
+
+app.MapPost("/products/search", async (EmbedRequest req, ProductStore store, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            { nameof(req.Text), ["Text should be greater than 0"] }
+        });
+    }
+
+    var embedding = await gen.GenerateAsync([req.Text], cancellationToken: ct);
+
+    var hits = store.Search(embedding[0].Vector);
+    return Results.Ok(hits.Select(h => new { source = h.Chunk.Source, score = h.Score }));
+
+});
+
+
+app.MapPost("/ask", async (EmbedRequest req, IEmbeddingGenerator<string, Embedding<float>> gen, ProductStore store, CancellationToken ct, IChatClient chat) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            { nameof(req.Text), ["Text should be greater than 0"] }
+        });
+    }
+
+    var embedding = await gen.GenerateAsync([req.Text], cancellationToken: ct);
+
+    var hits = store.Search(embedding[0].Vector);
+
+    var filtered = hits
+        .Where(h => h.Score > 0.5)
+        .ToList();
+
+    string facts = string.Join("\n", filtered.Select(h => $"[{h.Chunk.Source}] {h.Chunk.Text}"));
+
+    if(filtered.Count > 0) {
+        string prompt = $"""
+            You are a bank assistant answering a customer question.
+            Facts (from the bank's product catalog):
+            {facts}
+            Question: {req.Text}
+            Rules: answer only from the facts; if the facts do not contain the answer, say you don't know;
+            cite the source in brackets like [mortgage-loan]; plain language, no markdown, no financial advice.
+            """;
+
+        ChatResponse response = await chat.GetResponseAsync(prompt, cancellationToken: ct);
+        return Results.Ok(new { answer = response.Text, sources = filtered.Select(h => h.Chunk.Source) });
+
+    }else {
+        return Results.Ok(new { answer = "I can only answer questions about our bank products.", sources = Array.Empty<string>() });
+    }
+});
 
 
 app.Run();

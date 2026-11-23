@@ -1,0 +1,1 @@
+public record ProductChunk(string Source, string Text, ReadOnlyMemory<float> Vector);
