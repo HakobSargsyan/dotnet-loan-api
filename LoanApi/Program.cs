@@ -20,7 +20,7 @@ builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlite("Data Source=loans.
 builder.Services.AddSingleton<ILoanCalculator, SimpleCalculator>();
 builder.Services.AddSingleton<ILoanCalculator>(_ => new AnnuityCalculator(rate));
 builder.Services.AddChatClient(
-    new AnthropicClient { ApiKey = anthropicKey }.AsIChatClient("claude-haiku-5-5"));
+    new AnthropicClient { ApiKey = anthropicKey }.AsIChatClient("claude-haiku-5-5")).UseFunctionInvocation();
 builder.Services.AddEmbeddingGenerator(
     new OllamaApiClient(new Uri("http://localhost:11434"), "nomic-embed-text"));
 builder.Services.AddSingleton<ProductStore>();
@@ -305,6 +305,55 @@ app.MapPost("/ask", async (EmbedRequest req, IEmbeddingGenerator<string, Embeddi
         return Results.Ok(new { answer = "I can only answer questions about our bank products.", sources = Array.Empty<string>() });
     }
 });
+
+
+app.MapPost("/chat", async (EmbedRequest req, IEmbeddingGenerator<string, Embedding<float>> gen, ProductStore store, CancellationToken ct, IChatClient chat) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Text))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            { nameof(req.Text), ["Text should be greater than 0"] }
+        });
+    }
+
+    var loanTools = new LoanTools();
+    var productTools = new ProductTools(store, gen);
+    var options = new ChatOptions
+    {
+        Tools =
+        [
+            AIFunctionFactory.Create(loanTools.MonthlyPayment),
+            AIFunctionFactory.Create(productTools.SearchProducts)
+        ]
+    };
+
+
+
+    string systemPrompt = """
+        You are a bank assistant. All amounts are in AMD.
+        Take interest rates only from SearchProducts, never guess them.
+        Use MonthlyPayment for payments. Never calculate numbers yourself.
+        Plain text, no markdown. Politely decline non-banking questions.
+        """;
+
+    List<ChatMessage> messages =
+    [
+        new(ChatRole.System, systemPrompt),
+        new(ChatRole.User, req.Text)
+    ];
+
+    ChatResponse response = await chat.GetResponseAsync(messages, options, ct);
+
+    var toolCalls = response.Messages
+                        .SelectMany(m => m.Contents)
+                        .OfType<FunctionCallContent>()
+                        .Select(c => new { tool = c.Name, args = c.Arguments });
+
+    return Results.Ok(new { answer = response.Text, toolCalls });
+
+});
+
 
 
 app.Run();
