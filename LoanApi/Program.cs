@@ -5,6 +5,7 @@ using Anthropic;
 using Microsoft.Extensions.AI;
 using OllamaSharp;
 using System.Numerics.Tensors;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 string anthropicKey = builder.Configuration["Anthropic:ApiKey"]
@@ -19,13 +20,24 @@ decimal rate = builder.Configuration.GetValue<decimal?>("Loans:AnnualRate") ?? t
 builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlite("Data Source=loans.db"));
 builder.Services.AddSingleton<ILoanCalculator, SimpleCalculator>();
 builder.Services.AddSingleton<ILoanCalculator>(_ => new AnnuityCalculator(rate));
+builder.Services.AddRateLimiter(o =>
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;   // default is 503
+    o.AddPolicy("llm", ctx => RateLimitPartition.GetFixedWindowLimiter(
+        ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown", //every ip has it's own calc
+        _ => new FixedWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(1) }));
+});
+
 builder.Services.AddChatClient(
     new AnthropicClient { ApiKey = anthropicKey }.AsIChatClient("claude-haiku-5-5")).UseFunctionInvocation();
 builder.Services.AddEmbeddingGenerator(
     new OllamaApiClient(new Uri("http://localhost:11434"), "nomic-embed-text"));
 builder.Services.AddSingleton<ProductStore>();
+builder.Services.AddSingleton<LoanTools>();
+builder.Services.AddSingleton<ProductTools>();
 
 var app = builder.Build();
+app.UseRateLimiter();
 using (var scope = app.Services.CreateScope())
     scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.EnsureCreated();
 
@@ -307,7 +319,7 @@ app.MapPost("/ask", async (EmbedRequest req, IEmbeddingGenerator<string, Embeddi
 });
 
 
-app.MapPost("/chat", async (EmbedRequest req, IEmbeddingGenerator<string, Embedding<float>> gen, ProductStore store, CancellationToken ct, IChatClient chat) =>
+app.MapPost("/chat", async (EmbedRequest req, LoanTools loanTools, ProductTools productTools, CancellationToken ct, IChatClient chat, ILogger<Program> logger) =>
 {
     if (string.IsNullOrWhiteSpace(req.Text))
     {
@@ -317,8 +329,6 @@ app.MapPost("/chat", async (EmbedRequest req, IEmbeddingGenerator<string, Embedd
         });
     }
 
-    var loanTools = new LoanTools();
-    var productTools = new ProductTools(store, gen);
     var options = new ChatOptions
     {
         Tools =
@@ -343,7 +353,16 @@ app.MapPost("/chat", async (EmbedRequest req, IEmbeddingGenerator<string, Embedd
         new(ChatRole.User, req.Text)
     ];
 
-    ChatResponse response = await chat.GetResponseAsync(messages, options, ct);
+    ChatResponse response;
+    try
+    {
+        response = await chat.GetResponseAsync(messages, options, ct);
+    }
+    catch (Exception ex) when (!ct.IsCancellationRequested)
+    {
+        logger.LogError(ex, "LLM call failed");
+        return Results.Problem("The assistant is temporarily unavailable.", statusCode: 503);
+    }
 
     var toolCalls = response.Messages
                         .SelectMany(m => m.Contents)
@@ -352,8 +371,7 @@ app.MapPost("/chat", async (EmbedRequest req, IEmbeddingGenerator<string, Embedd
 
     return Results.Ok(new { answer = response.Text, toolCalls });
 
-});
-
+}).RequireRateLimiting("llm");
 
 
 app.Run();

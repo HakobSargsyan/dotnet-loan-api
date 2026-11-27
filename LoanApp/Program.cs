@@ -86,6 +86,13 @@ try{
     }
     Console.WriteLine($"Parallel: {sw.ElapsedMilliseconds} ms");
 
+
+    double[] scores2 = [0.9, 0.8, 0.7, 0.6, 0.4, 0.2];
+    bool[] labels   = [true, true, false, true, false, false];
+
+    var c = Metrics.Confusion(scores2, labels, 0.5);
+    Console.WriteLine($"TP={c.TP} FP={c.FP} FN={c.FN} TN={c.TN}");
+
 }catch(ArgumentOutOfRangeException e) {
     Console.WriteLine(e);
 }

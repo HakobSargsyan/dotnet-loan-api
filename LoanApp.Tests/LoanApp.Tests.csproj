@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\LoanApp\LoanApp.csproj" />
+    <ProjectReference Include="..\LoanApi\LoanApi.csproj" />
   </ItemGroup>
 
 </Project>
